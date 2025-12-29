@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Panel + Pyrogram Ubot (aio_bc both)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/aio-bc
+ExecStart=/root/aio-bc/.venv/bin/python /root/aio-bc/aio_bc_final.py both
+
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
