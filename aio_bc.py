@@ -1,9 +1,22 @@
+# aio_bc_final.py
+# Panel Bot (python-telegram-bot) + Ubot Sender (Pyrogram) dalam 1 file
+# Fitur:
+# - /setmsg simpan teks + entities (termasuk custom/premium emoji)
+# - whitelist dengan thread_key (-1 = non-topic, selain itu = topic id)
+# - /adddest /unwhitelist /blacklist /unblacklist bisa dipakai langsung di grup/topic (paling akurat)
+# - fallback forward kalau command dipakai di private
+# - /status + /listdest + /listblack
+# - /enable /disable
+# - /force (blast sekali semua whitelist) + /forcehere (blast sekali di chat/topic tempat command)
+# - safe_send max_retry + auto-remove dest yang error permanen biar gak nyangkut
+
 import asyncio
 import json
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple, Set
 
 from telegram import Update
 from telegram.ext import (
@@ -23,16 +36,37 @@ API_ID = 123456
 API_HASH = "ISI_API_HASH"
 OWNER_ID = 123456789  # id telegram kamu (lihat @userinfobot)
 
-DB_PATH = Path("data.db")
+# PENTING: absolut biar gak "ilang" karena beda WorkingDirectory
+DB_PATH = Path("/root/data.db")
 
-DEFAULT_INTERVAL_HOURS = 12  # 2x sehari
-DEFAULT_DELAY_SEC = 5        # delay antar grup
+DEFAULT_INTERVAL_HOURS = 12
+DEFAULT_DELAY_SEC = 5
+
+PYRO_SESSION_NAME = "userbot"  # akan jadi /root/userbot.session (biasanya)
+
+# =======================
+# UTIL
+# =======================
+def now() -> int:
+    return int(time.time())
+
+def fmt_ts(ts: int) -> str:
+    if not ts:
+        return "-"
+    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def thread_key_from(thread_id: Optional[int]) -> int:
+    return int(thread_id) if thread_id is not None else -1
 
 # =======================
 # DB
 # =======================
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users(
         owner_id INTEGER PRIMARY KEY,
@@ -43,14 +77,18 @@ def db() -> sqlite3.Connection:
         message_entities TEXT,
         next_run INTEGER DEFAULT 0
     )""")
+
+    # whitelist pakai thread_key (AMAN di SQLite)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS whitelist(
         owner_id INTEGER,
         chat_id INTEGER,
         thread_id INTEGER,
+        thread_key INTEGER DEFAULT -1,
         title TEXT,
-        UNIQUE(owner_id, chat_id, COALESCE(thread_id, -1))
+        UNIQUE(owner_id, chat_id, thread_key)
     )""")
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS blacklist(
         owner_id INTEGER,
@@ -58,7 +96,7 @@ def db() -> sqlite3.Connection:
         UNIQUE(owner_id, chat_id)
     )""")
 
-    # migrate kalau DB lama belum punya kolom tertentu
+    # migrate users (kalau DB lama)
     for ddl in [
         "ALTER TABLE users ADD COLUMN message_entities TEXT",
         "ALTER TABLE users ADD COLUMN next_run INTEGER DEFAULT 0",
@@ -68,38 +106,118 @@ def db() -> sqlite3.Connection:
         except sqlite3.OperationalError:
             pass
 
+    # migrate whitelist: tambah thread_key (kalau DB lama)
+    try:
+        conn.execute("ALTER TABLE whitelist ADD COLUMN thread_key INTEGER DEFAULT -1")
+    except sqlite3.OperationalError:
+        pass
+
+    # backfill thread_key untuk row lama yang NULL
+    try:
+        conn.execute("UPDATE whitelist SET thread_key=COALESCE(thread_id, -1) WHERE thread_key IS NULL")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
-def now() -> int:
-    return int(time.time())
-
 def ensure_user(owner_id: int):
     conn = db()
-    conn.execute("INSERT OR IGNORE INTO users(owner_id, interval_hours, delay_sec) VALUES(?,?,?)",
-                 (owner_id, DEFAULT_INTERVAL_HOURS, DEFAULT_DELAY_SEC))
+    conn.execute(
+        "INSERT OR IGNORE INTO users(owner_id, interval_hours, delay_sec) VALUES(?,?,?)",
+        (owner_id, DEFAULT_INTERVAL_HOURS, DEFAULT_DELAY_SEC)
+    )
     conn.commit()
     conn.close()
 
 # =======================
-# PANEL BOT COMMANDS
+# DB HELPERS
+# =======================
+def upsert_whitelist(owner_id: int, chat_id: int, thread_id: Optional[int], title: str) -> int:
+    tkey = thread_key_from(thread_id)
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO whitelist(owner_id, chat_id, thread_id, thread_key, title) VALUES(?,?,?,?,?)",
+        (owner_id, chat_id, thread_id, tkey, title)
+    )
+    conn.commit()
+    conn.close()
+    return tkey
+
+def delete_whitelist(owner_id: int, chat_id: int, thread_id: Optional[int]) -> int:
+    tkey = thread_key_from(thread_id)
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM whitelist WHERE owner_id=? AND chat_id=? AND thread_key=?",
+        (owner_id, chat_id, tkey)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount
+
+def add_blacklist(owner_id: int, chat_id: int):
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO blacklist(owner_id, chat_id) VALUES(?,?)", (owner_id, chat_id))
+    conn.commit()
+    conn.close()
+
+def remove_blacklist(owner_id: int, chat_id: int) -> int:
+    conn = db()
+    cur = conn.execute("DELETE FROM blacklist WHERE owner_id=? AND chat_id=?", (owner_id, chat_id))
+    conn.commit()
+    conn.close()
+    return cur.rowcount
+
+def remove_dest(owner_id: int, chat_id: int, thread_id: Optional[int]) -> int:
+    # auto-remove dest yang error permanen saat kirim
+    return delete_whitelist(owner_id, chat_id, thread_id)
+
+def get_user_config(owner_id: int):
+    conn = db()
+    u = conn.execute(
+        "SELECT interval_hours, delay_sec, enabled, message_text, message_entities, next_run "
+        "FROM users WHERE owner_id=?",
+        (owner_id,)
+    ).fetchone()
+
+    wl = conn.execute(
+        "SELECT chat_id, thread_id, title FROM whitelist WHERE owner_id=?",
+        (owner_id,)
+    ).fetchall()
+
+    bl = set(r[0] for r in conn.execute(
+        "SELECT chat_id FROM blacklist WHERE owner_id=?",
+        (owner_id,)
+    ).fetchall())
+
+    conn.close()
+    return u, wl, bl
+
+# =======================
+# PANEL COMMANDS
 # =======================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
     await update.message.reply_text(
         "✅ Panel BC siap.\n\n"
-        "Flow:\n"
-        "1) /setmsg → lalu kirim pesan BC (teks + premium emoji)\n"
-        "2) /adddest → forward pesan dari grup/topik tujuan\n"
-        "3) /enable\n\n"
+        "Flow paling aman (support forum/topics):\n"
+        "1) /setmsg → lalu kirim 1 pesan BC\n"
+        "2) Masuk grup/topik tujuan → ketik /adddest\n"
+        "3) /enable (jadwal) atau /force (langsung kirim sekali)\n\n"
         "Commands:\n"
-        "/setmsg\n"
-        "/adddest | /unwhitelist\n"
-        "/blacklist | /unblacklist\n"
-        "/setinterval 12 | /setdelay 5\n"
-        "/enable | /disable | /status\n\n"
-        "Catatan forum/topics: forward pesan dari topik yang kamu mau."
+        "/setmsg, /cancel\n"
+        "/adddest, /unwhitelist\n"
+        "/blacklist, /unblacklist\n"
+        "/setinterval 12, /setdelay 5\n"
+        "/enable, /disable, /status\n"
+        "/listdest, /listblack\n"
+        "/force, /forcehere\n\n"
+        "Catatan: untuk forum/topics, ketik /adddest & /unwhitelist langsung di TOPIC-nya."
     )
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("✅ Dibatalkan.")
 
 # ---- setmsg step-by-step (tanpa reply) ----
 async def cmd_setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,10 +230,6 @@ async def cmd_setmsg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• (Untuk batal) ketik /cancel"
     )
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("✅ Dibatalkan.")
-
 async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting") != "setmsg":
         return
@@ -126,10 +240,7 @@ async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await msg.reply_text("❌ Pesan harus berupa teks.")
 
     text = msg.text
-    ents = []
-    if msg.entities:
-        for e in msg.entities:
-            ents.append(e.to_dict())
+    ents = [e.to_dict() for e in (msg.entities or [])]
 
     conn = db()
     conn.execute(
@@ -140,7 +251,7 @@ async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     context.user_data.clear()
-    await msg.reply_text("✅ Pesan BC berhasil disimpan (premium emoji ikut).")
+    await msg.reply_text("✅ Pesan BC berhasil disimpan (entities/premium emoji ikut).")
 
 # ---- interval/delay ----
 async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,7 +266,6 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     conn.execute("UPDATE users SET interval_hours=? WHERE owner_id=?", (hours, update.effective_user.id))
-    # kalau enabled, reschedule dari sekarang + interval
     row = conn.execute("SELECT enabled FROM users WHERE owner_id=?", (update.effective_user.id,)).fetchone()
     if row and int(row[0]) == 1:
         conn.execute("UPDATE users SET next_run=? WHERE owner_id=?",
@@ -184,26 +294,76 @@ async def cmd_setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text(f"✅ Delay antar grup diset: {sec} detik.")
 
-# ---- add/remove dest via forward ----
+# ---- whitelist/blacklist smart (langsung di grup/topic) + fallback forward di private ----
 async def cmd_adddest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
+    chat = update.effective_chat
+    msg = update.message
+
+    if chat and chat.type in ("group", "supergroup"):
+        chat_id = chat.id
+        thread_id = getattr(msg, "message_thread_id", None)
+        title = chat.title or str(chat_id)
+        tkey = upsert_whitelist(update.effective_user.id, chat_id, thread_id, title)
+        return await msg.reply_text(
+            f"✅ Masuk whitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}\nthread_key={tkey}\n\n"
+            f"Forum: pastiin kamu ketik /adddest di TOPIC yang mau dituju."
+        )
+
     context.user_data["mode"] = "whitelist"
-    await update.message.reply_text("Forward 1 pesan dari grup/topik tujuan untuk masuk WHITELIST.\n(Forum: forward dari topiknya)")
+    await msg.reply_text(
+        "Forward 1 pesan dari grup/topik tujuan untuk masuk WHITELIST.\n"
+        "(Forum/topics paling akurat: ketik /adddest langsung di topiknya.)"
+    )
 
 async def cmd_unwhitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
+    chat = update.effective_chat
+    msg = update.message
+
+    if chat and chat.type in ("group", "supergroup"):
+        chat_id = chat.id
+        thread_id = getattr(msg, "message_thread_id", None)
+        title = chat.title or str(chat_id)
+        deleted = delete_whitelist(update.effective_user.id, chat_id, thread_id)
+        return await msg.reply_text(
+            f"🗑️ Unwhitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}\nTerhapus: {deleted}\n\n"
+            f"Forum: ketik /unwhitelist di TOPIC yang sesuai."
+        )
+
     context.user_data["mode"] = "unwhitelist"
-    await update.message.reply_text("Forward 1 pesan dari grup/topik yang mau dihapus dari WHITELIST.")
+    await msg.reply_text(
+        "Forward 1 pesan dari grup/topik yang mau dihapus dari WHITELIST.\n"
+        "(Forum/topics paling akurat: ketik /unwhitelist langsung di topiknya.)"
+    )
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
+    chat = update.effective_chat
+    msg = update.message
+
+    if chat and chat.type in ("group", "supergroup"):
+        chat_id = chat.id
+        title = chat.title or str(chat_id)
+        add_blacklist(update.effective_user.id, chat_id)
+        return await msg.reply_text(f"⛔ Masuk blacklist: {title}\nchat_id={chat_id}")
+
     context.user_data["mode"] = "blacklist"
-    await update.message.reply_text("Forward 1 pesan dari grup yang mau diblok (BLACKLIST).")
+    await msg.reply_text("Forward 1 pesan dari grup yang mau diblok (BLACKLIST).")
 
 async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_user.id)
+    chat = update.effective_chat
+    msg = update.message
+
+    if chat and chat.type in ("group", "supergroup"):
+        chat_id = chat.id
+        title = chat.title or str(chat_id)
+        deleted = remove_blacklist(update.effective_user.id, chat_id)
+        return await msg.reply_text(f"✅ Dihapus dari blacklist: {title}\nchat_id={chat_id}\nTerhapus: {deleted}")
+
     context.user_data["mode"] = "unblacklist"
-    await update.message.reply_text("Forward 1 pesan dari grup yang mau dibuka blokirnya (UNBLACKLIST).")
+    await msg.reply_text("Forward 1 pesan dari grup yang mau dibuka blokirnya (UNBLACKLIST).")
 
 async def on_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("mode")
@@ -218,46 +378,25 @@ async def on_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     owner_id = update.effective_user.id
     chat_id = fchat.id
-    thread_id = getattr(msg, "message_thread_id", None)  # ada kalau forum topic
+    thread_id = getattr(msg, "message_thread_id", None)
+    tkey = thread_key_from(thread_id)
     title = fchat.title or str(chat_id)
 
-    conn = db()
-
     if mode == "whitelist":
-        conn.execute(
-            "INSERT OR IGNORE INTO whitelist(owner_id, chat_id, thread_id, title) VALUES(?,?,?,?)",
-            (owner_id, chat_id, thread_id, title)
-        )
-        conn.commit()
-        conn.close()
-        await msg.reply_text(f"✅ Masuk whitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}")
+        upsert_whitelist(owner_id, chat_id, thread_id, title)
+        await msg.reply_text(f"✅ Masuk whitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}\nthread_key={tkey}")
 
     elif mode == "blacklist":
-        conn.execute("INSERT OR IGNORE INTO blacklist(owner_id, chat_id) VALUES(?,?)", (owner_id, chat_id))
-        conn.commit()
-        conn.close()
+        add_blacklist(owner_id, chat_id)
         await msg.reply_text(f"⛔ Masuk blacklist: {title}\nchat_id={chat_id}")
 
     elif mode == "unwhitelist":
-        if thread_id is None:
-            conn.execute(
-                "DELETE FROM whitelist WHERE owner_id=? AND chat_id=? AND thread_id IS NULL",
-                (owner_id, chat_id)
-            )
-        else:
-            conn.execute(
-                "DELETE FROM whitelist WHERE owner_id=? AND chat_id=? AND thread_id=?",
-                (owner_id, chat_id, thread_id)
-            )
-        conn.commit()
-        conn.close()
-        await msg.reply_text(f"🗑️ Dihapus dari whitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}")
+        deleted = delete_whitelist(owner_id, chat_id, thread_id)
+        await msg.reply_text(f"🗑️ Dihapus dari whitelist: {title}\nchat_id={chat_id}\nthread_id={thread_id}\nTerhapus: {deleted}")
 
     elif mode == "unblacklist":
-        conn.execute("DELETE FROM blacklist WHERE owner_id=? AND chat_id=?", (owner_id, chat_id))
-        conn.commit()
-        conn.close()
-        await msg.reply_text(f"✅ Dihapus dari blacklist: {title}\nchat_id={chat_id}")
+        deleted = remove_blacklist(owner_id, chat_id)
+        await msg.reply_text(f"✅ Dihapus dari blacklist: {title}\nchat_id={chat_id}\nTerhapus: {deleted}")
 
     context.user_data.clear()
 
@@ -277,7 +416,7 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("❌ Set dulu pesan: /setmsg lalu kirim pesannya.")
     if wcnt == 0:
         conn.close()
-        return await update.message.reply_text("❌ Tambah dulu whitelist: /adddest")
+        return await update.message.reply_text("❌ Tambah dulu whitelist: /adddest (langsung di grup/topic)")
 
     interval_hours = int(row[0])
     conn.execute(
@@ -305,20 +444,98 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ).fetchone()
     wcnt = conn.execute("SELECT COUNT(*) FROM whitelist WHERE owner_id=?", (update.effective_user.id,)).fetchone()[0]
     bcnt = conn.execute("SELECT COUNT(*) FROM blacklist WHERE owner_id=?", (update.effective_user.id,)).fetchone()[0]
+    sample = conn.execute(
+        "SELECT title, chat_id, thread_id FROM whitelist WHERE owner_id=? ORDER BY rowid DESC LIMIT 5",
+        (update.effective_user.id,)
+    ).fetchall()
     conn.close()
 
-    await update.message.reply_text(
-        f"Enabled: {bool(row[2])}\n"
-        f"Interval: {row[0]} jam\n"
-        f"Delay/grup: {row[1]} detik\n"
-        f"Whitelist: {wcnt}\n"
-        f"Blacklist: {bcnt}\n"
-        f"Message set: {bool(row[3])}\n"
-        f"Next run (epoch): {row[4]}"
-    )
+    interval_hours, delay_sec, enabled, message_text, next_run = row
+    next_run_human = fmt_ts(int(next_run)) if next_run else "-"
+
+    lines = [
+        f"Enabled: {bool(enabled)}",
+        f"Interval: {interval_hours} jam",
+        f"Delay/grup: {delay_sec} detik",
+        f"Whitelist: {wcnt}",
+        f"Blacklist: {bcnt}",
+        f"Message set: {bool(message_text)}",
+        f"Next run: {next_run_human} (epoch={next_run})",
+    ]
+    if sample:
+        lines.append("\nContoh whitelist (max 5):")
+        for title, chat_id, thread_id in sample:
+            lines.append(f"• {title} | chat_id={chat_id} | thread_id={thread_id}")
+
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_listdest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user.id)
+    conn = db()
+    rows = conn.execute(
+        "SELECT title, chat_id, thread_id FROM whitelist WHERE owner_id=? ORDER BY title COLLATE NOCASE",
+        (update.effective_user.id,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await update.message.reply_text("Whitelist kosong. Pakai /adddest dulu.")
+
+    out = ["📌 WHITELIST:"]
+    for title, chat_id, thread_id in rows[:80]:
+        out.append(f"• {title} | chat_id={chat_id} | thread_id={thread_id}")
+    if len(rows) > 80:
+        out.append(f"... dan {len(rows)-80} lainnya")
+
+    await update.message.reply_text("\n".join(out))
+
+async def cmd_listblack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_user.id)
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id FROM blacklist WHERE owner_id=? ORDER BY chat_id",
+        (update.effective_user.id,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return await update.message.reply_text("Blacklist kosong.")
+
+    out = ["⛔ BLACKLIST:"]
+    for (chat_id,) in rows[:150]:
+        out.append(f"• chat_id={chat_id}")
+    if len(rows) > 150:
+        out.append(f"... dan {len(rows)-150} lainnya")
+
+    await update.message.reply_text("\n".join(out))
 
 # =======================
-# UBOT SENDER
+# ENTITIES BUILDER
+# =======================
+def build_entities(message_entities_json: Optional[str]):
+    if not message_entities_json:
+        return None
+    try:
+        raw = json.loads(message_entities_json)
+        entities: List[MessageEntity] = []
+        for e in raw:
+            entities.append(
+                MessageEntity(
+                    type=e.get("type"),
+                    offset=e.get("offset", 0),
+                    length=e.get("length", 0),
+                    url=e.get("url"),
+                    user=e.get("user"),
+                    language=e.get("language"),
+                    custom_emoji_id=e.get("custom_emoji_id"),
+                )
+            )
+        return entities
+    except Exception:
+        return None
+
+# =======================
+# UBOT SENDER CORE
 # =======================
 def fetch_owner_config(owner_id: int):
     conn = db()
@@ -347,47 +564,51 @@ def update_next_run(owner_id: int, next_run: int):
     conn.commit()
     conn.close()
 
-def build_entities(message_entities_json: Optional[str]):
-    if not message_entities_json:
-        return None
-    try:
-        raw = json.loads(message_entities_json)
-        entities = []
-        for e in raw:
-            entities.append(
-                MessageEntity(
-                    type=e.get("type"),
-                    offset=e.get("offset", 0),
-                    length=e.get("length", 0),
-                    url=e.get("url"),
-                    user=e.get("user"),
-                    language=e.get("language"),
-                    custom_emoji_id=e.get("custom_emoji_id"),
-                )
+async def safe_send(
+    app: Client,
+    owner_id: int,
+    chat_id: int,
+    thread_id: Optional[int],
+    text: str,
+    entities,
+    max_retry: int = 3
+) -> bool:
+    attempt = 0
+    while True:
+        try:
+            await app.send_message(
+                chat_id=chat_id,
+                text=text,
+                entities=entities,
+                message_thread_id=thread_id
             )
-        return entities
-    except Exception:
-        return None
+            return True
 
-async def safe_send(app: Client, chat_id: int, thread_id: Optional[int], text: str, entities):
-    try:
-        await app.send_message(
-            chat_id=chat_id,
-            text=text,
-            entities=entities,
-            message_thread_id=thread_id
-        )
-    except SlowmodeWait as e:
-        await asyncio.sleep(int(getattr(e, "value", 0)) or 10)
-        return await safe_send(app, chat_id, thread_id, text, entities)
-    except FloodWait as e:
-        await asyncio.sleep(int(getattr(e, "value", 0)) or 30)
-        return await safe_send(app, chat_id, thread_id, text, entities)
-    except RPCError:
-        return
+        except SlowmodeWait as e:
+            attempt += 1
+            wait_s = int(getattr(e, "value", 0)) or 10
+            if attempt > max_retry:
+                return False
+            await asyncio.sleep(wait_s)
+
+        except FloodWait as e:
+            attempt += 1
+            wait_s = int(getattr(e, "value", 0)) or 30
+            if attempt > max_retry:
+                return False
+            await asyncio.sleep(wait_s)
+
+        except RPCError as e:
+            removed = remove_dest(owner_id, chat_id, thread_id)
+            print(f"⚠️ RPCError={type(e).__name__} chat_id={chat_id} thread_id={thread_id} removed={removed}")
+            return False
+
+        except Exception as e:
+            print(f"⚠️ UnknownError={type(e).__name__} chat_id={chat_id} thread_id={thread_id}")
+            return False
 
 async def ubot_loop():
-    app = Client("userbot", api_id=API_ID, api_hash=API_HASH)
+    app = Client(PYRO_SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
     await app.start()
     print("✅ Ubot sender running...")
 
@@ -409,14 +630,107 @@ async def ubot_loop():
 
         entities = build_entities(message_entities)
 
-        # WHITELIST ONLY + BLACKLIST WINS
         for chat_id, thread_id in wl:
             if chat_id in bl:
                 continue
-            await safe_send(app, chat_id, thread_id, message_text, entities)
+            await safe_send(app, OWNER_ID, chat_id, thread_id, message_text, entities, max_retry=3)
             await asyncio.sleep(float(delay_sec))
 
         update_next_run(OWNER_ID, now() + int(interval_hours) * 3600)
+
+# =======================
+# FORCE SEND COMMANDS
+# =======================
+async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner_id = update.effective_user.id
+    ensure_user(owner_id)
+
+    u, wl, bl = get_user_config(owner_id)
+    if not u:
+        return await update.message.reply_text("❌ Config user tidak ketemu.")
+
+    interval_hours, delay_sec, enabled, message_text, message_entities, next_run = u
+    if not message_text:
+        return await update.message.reply_text("❌ Pesan belum diset. Pakai /setmsg dulu.")
+    if not wl:
+        return await update.message.reply_text("❌ Whitelist kosong. Pakai /adddest dulu.")
+
+    await update.message.reply_text("🚀 Force BC dimulai...")
+
+    app = Client(PYRO_SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+    try:
+        await app.start()
+    except Exception as e:
+        return await update.message.reply_text(f"❌ Gagal start userbot: {type(e).__name__}")
+
+    entities = build_entities(message_entities)
+
+    sent = 0
+    skipped = 0
+
+    for chat_id, thread_id, title in wl:
+        if chat_id in bl:
+            skipped += 1
+            continue
+
+        ok = await safe_send(app, owner_id, chat_id, thread_id, message_text, entities, max_retry=3)
+        if ok:
+            sent += 1
+        else:
+            skipped += 1
+
+        await asyncio.sleep(float(delay_sec))
+
+    try:
+        await app.stop()
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ Force selesai.\nTerkirim: {sent}\nSkip/Gagal/Blacklist: {skipped}")
+
+async def cmd_forcehere(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner_id = update.effective_user.id
+    ensure_user(owner_id)
+
+    chat = update.effective_chat
+    msg = update.message
+    if not chat:
+        return await msg.reply_text("❌ Chat tidak kebaca.")
+
+    u, wl, bl = get_user_config(owner_id)
+    if not u:
+        return await msg.reply_text("❌ Config user tidak ketemu.")
+    interval_hours, delay_sec, enabled, message_text, message_entities, next_run = u
+
+    if not message_text:
+        return await msg.reply_text("❌ Pesan belum diset. Pakai /setmsg dulu.")
+
+    chat_id = chat.id
+    thread_id = getattr(msg, "message_thread_id", None)
+
+    if chat_id in bl:
+        return await msg.reply_text("⛔ Chat ini lagi masuk blacklist.")
+
+    await msg.reply_text("🚀 Forcehere dimulai...")
+
+    app = Client(PYRO_SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+    try:
+        await app.start()
+    except Exception as e:
+        return await msg.reply_text(f"❌ Gagal start userbot: {type(e).__name__}")
+
+    entities = build_entities(message_entities)
+    ok = await safe_send(app, owner_id, chat_id, thread_id, message_text, entities, max_retry=3)
+
+    try:
+        await app.stop()
+    except Exception:
+        pass
+
+    if ok:
+        await msg.reply_text("✅ Forcehere sukses terkirim.")
+    else:
+        await msg.reply_text("⚠️ Forcehere gagal / di-skip.")
 
 # =======================
 # RUNNERS
@@ -439,9 +753,15 @@ async def run_panel():
     application.add_handler(CommandHandler("enable", cmd_enable))
     application.add_handler(CommandHandler("disable", cmd_disable))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("listdest", cmd_listdest))
+    application.add_handler(CommandHandler("listblack", cmd_listblack))
 
-    # IMPORTANT: command handler dulu, baru text handler
+    application.add_handler(CommandHandler("force", cmd_force))
+    application.add_handler(CommandHandler("forcehere", cmd_forcehere))
+
+    # forward handler (fallback private)
     application.add_handler(MessageHandler(filters.FORWARDED, on_forward))
+    # text handler untuk setmsg
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input))
 
     await application.run_polling(close_loop=False)
@@ -452,7 +772,6 @@ async def main():
     p.add_argument("mode", choices=["panel", "ubot", "both"], help="Jalankan panel / ubot / keduanya")
     args = p.parse_args()
 
-    # init db
     c = db()
     c.close()
 
