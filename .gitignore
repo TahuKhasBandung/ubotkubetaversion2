@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+
+data.db
+backups/
+*.sqlite
+*.sqlite.gz
+
+*.session
+*.session-journal
