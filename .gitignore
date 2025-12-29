@@ -1,11 +1,8 @@
-venv/
-__pycache__/
-*.pyc
-
-data.db
-backups/
-*.sqlite
-*.sqlite.gz
-
+.env
 *.session
 *.session-journal
+data.db
+__pycache__/
+*.pyc
+.venv/
+venv/
