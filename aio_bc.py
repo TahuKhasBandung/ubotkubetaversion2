@@ -14,6 +14,7 @@ import asyncio
 import json
 import sqlite3
 import time
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Tuple, Set
@@ -27,6 +28,24 @@ from telegram.ext import (
 from pyrogram import Client
 from pyrogram.errors import FloodWait, SlowmodeWait, RPCError
 from pyrogram.types import MessageEntity
+
+# =======================
+# LOAD .env (TARUH DI SINI)
+# =======================
+def load_env_file(path: str):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+BASE_DIR = Path(__file__).resolve().parent
+load_env_file(str(BASE_DIR / ".env"))
+
 
 # =======================
 # CONFIG (DIAMBIL DARI .env / ENV)
