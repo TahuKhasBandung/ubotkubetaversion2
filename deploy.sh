@@ -15,7 +15,7 @@ echo "[2/6] Install deps..."
 
 echo "[3/6] Ensure .env..."
 if [ ! -f ".env" ]; then
-  echo "❌ .env belum ada. Copy dari .env.example dulu:"
+  echo "❌ .env belum ada"
   echo "cp .env.example .env && nano .env"
   exit 1
 fi
@@ -28,8 +28,5 @@ sudo systemctl enable ubot.service
 echo "[5/6] Restart service..."
 sudo systemctl restart ubot.service
 
-echo "[6/6] Done. Cek log:"
-echo "journalctl -u ubot.service -f"
-echo ""
-echo "⚠️ Kalau ini pertama kali, login pyrogram dulu (sekali):"
-echo "$APP_DIR/.venv/bin/python $APP_DIR/aio_bc_final.py ubot"
+echo "[6/6] Done"
+echo "Log: journalctl -u ubot.service -f"
