@@ -29,20 +29,24 @@ from pyrogram.errors import FloodWait, SlowmodeWait, RPCError
 from pyrogram.types import MessageEntity
 
 # =======================
-# CONFIG (WAJIB DIISI)
+# CONFIG (DIAMBIL DARI .env / ENV)
 # =======================
-TOKEN = "ISI_TOKEN_BOTFATHER"
-API_ID = 123456
-API_HASH = "ISI_API_HASH"
-OWNER_ID = 123456789  # id telegram kamu (lihat @userinfobot)
+TOKEN = os.getenv("TOKEN", "ISI_TOKEN_BOTFATHER")
+API_ID = int(os.getenv("API_ID", "123456"))
+API_HASH = os.getenv("API_HASH", "ISI_API_HASH")
+OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))  # id telegram kamu (@userinfobot)
 
-# PENTING: absolut biar gak "ilang" karena beda WorkingDirectory
-DB_PATH = Path("/root/data.db")
+# rekomendasi: taruh DB di folder project biar rapi
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data.db")))
 
-DEFAULT_INTERVAL_HOURS = 12
-DEFAULT_DELAY_SEC = 5
+DEFAULT_INTERVAL_HOURS = int(os.getenv("DEFAULT_INTERVAL_HOURS", "12"))
+DEFAULT_DELAY_SEC = float(os.getenv("DEFAULT_DELAY_SEC", "5"))
 
-PYRO_SESSION_NAME = "userbot"  # akan jadi /root/userbot.session (biasanya)
+PYRO_SESSION_NAME = os.getenv("PYRO_SESSION_NAME", "userbot")
+
+# optional: validasi biar gak jalan kalau belum diisi beneran
+if TOKEN == "ISI_TOKEN_BOTFATHER" or API_HASH == "ISI_API_HASH" or API_ID == 123456 or OWNER_ID == 123456789:
+    print("⚠️ CONFIG belum diisi. Isi file .env dulu (lihat .env.example).")
 
 # =======================
 # UTIL
